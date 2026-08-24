@@ -2,7 +2,7 @@
 
 import contextlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch._dynamo.utils import counters
@@ -284,6 +284,40 @@ class TestBenchmarker(TestCase):
 
         self.assertEqual(result, 5.0)
         self.assertEqual(calls, [{"grad_to_none": None, "estimation_iters": 2}])
+
+    def test_xpu_graph_handler_uses_xpu_graph(self):
+        benchmarker = Benchmarker()
+        benchmarker.benchmark_gpu = benchmark_gpu = Mock(return_value=6.0)
+        callable_ = Mock()
+        xpu = Mock()
+        stream = Mock()
+        graph = Mock()
+        tensor = Mock()
+        xpu.Stream.return_value = stream
+        xpu.XPUGraph.return_value = graph
+        xpu.stream.return_value = contextlib.nullcontext()
+        xpu.graph.return_value = contextlib.nullcontext()
+
+        with patch.object(torch, "xpu", xpu):
+            result = benchmarker.benchmark_gpu_with_graph(
+                callable_,
+                device="xpu",
+                grad_to_none=[tensor],
+                warmup=2,
+                rep=4,
+            )
+
+        self.assertEqual(result, 6.0)
+        self.assertGreaterEqual(callable_.call_count, 3)
+        self.assertGreaterEqual(xpu.synchronize.call_count, 2)
+        xpu.graph.assert_called_once_with(graph, stream=stream)
+        benchmark_gpu.assert_called_once_with(
+            graph.replay,
+            device_type="xpu",
+            warmup=2,
+            rep=4,
+        )
+        self.assertIsNone(tensor.grad)
 
     def test_benchmark_request_propagates_inferred_graph_device(self):
         from torch._inductor import autotune_process

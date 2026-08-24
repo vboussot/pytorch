@@ -474,7 +474,36 @@ def _default_cuda_graph_bench(self, f, *, grad_to_none=None, **kw):
     )
 
 
+def _default_xpu_graph_bench(self, f, *, grad_to_none=None, **kw):
+    torch.xpu.synchronize()
+    f()
+    torch.xpu.synchronize()
+
+    stream = torch.xpu.Stream()
+    stream.wait_stream(torch.xpu.current_stream())
+    with torch.xpu.stream(stream):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        f()
+    stream.synchronize()
+
+    xpu_graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(xpu_graph, stream=stream):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        f()
+
+    torch.xpu.current_stream().wait_stream(stream)
+    torch.xpu.synchronize()
+
+    kw["device_type"] = "xpu"
+    return self.benchmark_gpu(xpu_graph.replay, **kw)
+
+
 register_graph_benchmarker("cuda", _default_cuda_graph_bench, override=True)
+register_graph_benchmarker("xpu", _default_xpu_graph_bench, override=True)
 
 
 def _get_callable_device_kernel_time_us(
