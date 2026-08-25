@@ -12,7 +12,9 @@ _pathfinder_find_spec = PathFinder.find_spec
 _FLYDSL_SUPPORTED_RELEASE = (0, 3)
 
 
-def _flydsl_runtime_unavailable_reason() -> str | None:
+def _flydsl_runtime_unavailable_reason(
+    minimum_version: tuple[int, ...] | None = None,
+) -> str | None:
     try:
         flydsl_spec = find_spec("flydsl")
     except (ImportError, ValueError):
@@ -35,7 +37,16 @@ def _flydsl_runtime_unavailable_reason() -> str | None:
     flydsl_version = _available_version("flydsl")
     if flydsl_version is None:
         return "missing or invalid FlyDSL version metadata"
-    if flydsl_version.release[:2] != _FLYDSL_SUPPORTED_RELEASE:
+    if minimum_version is not None and flydsl_version.release < minimum_version:
+        required = ".".join(map(str, minimum_version))
+        return (
+            f"unsupported FlyDSL version `{flydsl_version}` "
+            f"(expected at least `{required}`)"
+        )
+    if (
+        minimum_version is None
+        and flydsl_version.release[:2] != _FLYDSL_SUPPORTED_RELEASE
+    ):
         supported = ".".join(map(str, _FLYDSL_SUPPORTED_RELEASE))
         return (
             f"unsupported FlyDSL version `{flydsl_version}` (expected `{supported}.x`)"
@@ -45,7 +56,7 @@ def _flydsl_runtime_unavailable_reason() -> str | None:
 
 
 @functools.cache
-def _check_runtime_available() -> bool:
+def _check_runtime_available(minimum_version: tuple[int, ...] | None) -> bool:
     import torch
 
     if not _cuda.is_built():
@@ -54,7 +65,7 @@ def _check_runtime_available() -> bool:
     if torch.version.hip is None:
         return False
 
-    reason = _flydsl_runtime_unavailable_reason()
+    reason = _flydsl_runtime_unavailable_reason(minimum_version)
     if reason is not None:
         log.debug("FlyDSL Inductor templates are unavailable: %s", reason)
         return False
@@ -62,5 +73,5 @@ def _check_runtime_available() -> bool:
     return True
 
 
-def runtime_available() -> bool:
-    return _check_runtime_available()
+def runtime_available(*, minimum_version: tuple[int, ...] | None = None) -> bool:
+    return _check_runtime_available(minimum_version)
