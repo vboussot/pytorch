@@ -17833,10 +17833,34 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         _, codes = run_fw_bw_and_get_code(lambda: opt_fn(x))
         self.assertEqual(len(codes), 2)
 
-    @unittest.skipIf(
-        config.cpp_wrapper,
-        "codegen triton_kernel_wrapper_functional is not implemented for cpp wrapper",
-    )
+    def test_lite_mode_cpp_wrapper_optional_device_arg(self):
+        # `aten::zeros_like` has a `Device? device=None` parameter. val_to_arg_str
+        # spells a missing Optional[Device] as the c-shim's two-token
+        # "nullptr, 0" rather than a bare "nullptr", and the StableIValue fallback
+        # path used to wrap that whole pair in one conversion, emitting
+        #     std::optional tmp_var_1{torch::stable::detail::from(nullptr, 0)};
+        # which has no matching overload, so the generated C++ did not compile.
+        # Lite mode makes zeros_like a fallback and, having no c-shim, it goes
+        # through aoti_torch_call_dispatcher -- so this is the shortest path to
+        # the bug.
+        if self.device != GPU_TYPE:
+            raise unittest.SkipTest("requires GPU")
+
+        def f(x):
+            return torch.zeros_like(x) + x
+
+        x = torch.randn(64, device=self.device)
+
+        with config.patch(cpp_wrapper=True):
+            opt_f = torch.compile(f, mode="lite")
+            result, code = run_and_get_code(opt_f, x)
+
+        self.assertEqual(result, f(x))
+        # The optional device must be passed as nullopt, not as a (pointer, index)
+        # pair spliced into a single conversion.
+        self.assertIn("aten::zeros_like", code[0])
+        self.assertNotIn("from(nullptr, 0)", code[0])
+
     def test_lite_triton_kernel_wrapper_functional(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
@@ -18032,11 +18056,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             FileCheck().check("torch.ops.aten.add").run(code[0])
 
     @requires_gpu_and_triton
-    @unittest.skipIf(
-        config.cpp_wrapper,
-        "lite mode + user-defined Triton kernel is not supported by the cpp wrapper "
-        "(same reason as test_lite_triton_kernel_wrapper_functional above)",
-    )
     def test_lite_mode_triton_kernel_no_clone(self):
         # `decompose_triton_kernel_wrapper_functional` lowers the functional HOP to
         # "clone(s) + the mutation node", and documents that it relies on the
@@ -18061,13 +18080,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(result, f(x, y))
 
         # Anchor: the kernel really made it into the generated code, so the no-clone
-        # assertion below cannot pass vacuously.
-        self.assertIn("add_kernel", code[0])
+        # assertion below cannot pass vacuously. Under the cpp wrapper the bare name
+        # also occurs inside the embedded Triton source string, so anchor on the
+        # generated launch wrapper (`call_<kernel>`) instead -- that is the only
+        # spelling that means the kernel is actually called.
+        self.assertIn(
+            "call_add_kernel" if config.cpp_wrapper else "add_kernel", code[0]
+        )
         # The buffer the kernel writes is allocated immediately before the call and
         # never read beforehand, so reinplacing must drop it from `tensors_to_clone`
         # and the decomposition must emit no copy at all.
+        #
+        # The cpp-wrapper needle is `aten::clone`, NOT `aoti_torch_clone`: aten.clone
+        # has no c-shim entry in inductor_fallback_ops, so in lite mode it becomes a
+        # FallbackKernel that emits aoti_torch_call_dispatcher("aten::clone", ...).
+        # `aoti_torch_clone` is only ever emitted for returning constant buffers, so
+        # asserting on it would pass even if a clone *were* generated.
         self.assertNotIn(
-            "aoti_torch_clone" if config.cpp_wrapper else "aten.clone", code[0]
+            "aten::clone" if config.cpp_wrapper else "aten.clone", code[0]
         )
 
     @lowering.force_fallback(aten.sort.default)
