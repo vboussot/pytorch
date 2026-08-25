@@ -710,12 +710,12 @@ class IRNode:
                 # nodes in the backward graph don't have mapping to pre_grad_graph
                 stack_traces.add(node.stack_trace)
             else:
-                pre_grad_nodes = (
-                    torch._inductor.debug._inductor_post_to_pre_grad_nodes.get(
-                        "postToPre",
-                        {},
-                        # pyrefly: ignore [missing-attribute]
-                    ).get(node.name, [])
+                pre_grad_nodes = torch._inductor.debug._inductor_post_to_pre_grad_nodes.get(
+                    "postToPre",
+                    {},
+                    # pyrefly: ignore [missing-attribute]
+                ).get(
+                    node.name, []
                 )
                 if not isinstance(pre_grad_nodes, list):
                     continue
@@ -1174,9 +1174,7 @@ class Loops(IRNode):
     def collect_inner_fn_symbol_usage(self, symbol: Symbol) -> OrderedSet[str]:
         index = self._index(self.ranges)
         handler = SymbolUsageCollectorOpsHandler(symbol)
-        with (
-            V.set_ops_handler(handler),
-        ):
+        with (V.set_ops_handler(handler),):
             self.inner_fn(index)
         return handler.usages
 
@@ -1320,6 +1318,47 @@ class Scatter(Pointwise):
             indexer(self.output_indexer(vars)),
             loader(vars),
             mode=self.scatter_mode,
+        )
+
+
+@ir_dataclass
+class PaddedScatter(Scatter):
+    dynamic_padding_numel: Expr | None = None
+    dynamic_padding_mask: Callable[[Expr], Sequence[Expr]] | None = None
+    padding_value: bool | float | int = 0
+
+    def constant_to_device(self, device: torch.device) -> IRNode:
+        loader = self.make_loader()
+        loader = patch.object(ConstantBuffer, "override_device", device)(loader)
+        return PaddedScatter(
+            device=device,
+            dtype=self.dtype,
+            inner_fn=loader,
+            ranges=self.ranges,
+            output_indexer=self.output_indexer,
+            scatter_mode=self.scatter_mode,
+            dynamic_padding_numel=self.dynamic_padding_numel,
+            dynamic_padding_mask=self.dynamic_padding_mask,
+            padding_value=self.padding_value,
+        )
+
+    def get_auxiliary_writes(
+        self,
+        indexer: Callable[[Sequence[Expr]], Expr],
+    ) -> tuple[AuxiliaryWriteRegion, ...]:
+        if self.dynamic_padding_numel is None:
+            return ()
+        if self.dynamic_padding_mask is None:
+            raise AssertionError("dynamic padding mask is required")
+        auxiliary_index = Symbol("auxiliary_index", integer=True, nonnegative=True)
+        return (
+            AuxiliaryWriteRegion(
+                numel=self.dynamic_padding_numel,
+                index_var=auxiliary_index,
+                output_index=indexer([auxiliary_index]),
+                predicate=sympy.Or(*self.dynamic_padding_mask(auxiliary_index)),
+                value=self.padding_value,
+            ),
         )
 
 
@@ -3154,7 +3193,8 @@ class Scan(Loops):
         if num_splits > 1:
             triton_supports_split = (
                 # pyrefly: ignore [unsupported-operation]
-                torch.version.hip is None or (has_triton and triton_version >= "3.3.0")
+                torch.version.hip is None
+                or (has_triton and triton_version >= "3.3.0")
             )
             supports_split = (
                 triton_supports_split
@@ -6258,8 +6298,9 @@ class TemplateBuffer(OperationBuffer):
         structured: object,
         *,
         direct_alias_at_leaf: dict[int, IRNode] | None = None,
-        on_tensor_leaf: Callable[[str, MultiOutput, list[tuple[type, int]], int], None]
-        | None = None,
+        on_tensor_leaf: (
+            Callable[[str, MultiOutput, list[tuple[type, int]], int], None] | None
+        ) = None,
         on_non_tensor_leaf: Callable[[int], None] | None = None,
     ) -> tuple[TensorBox, ...]:
         """Walk a structured output tree, creating MultiOutput nodes for tensor leaves."""
@@ -11516,9 +11557,11 @@ class Switch(ExternKernel):
             MultiOutput(
                 FixedLayout(
                     # pyrefly: ignore [bad-argument-type]
-                    device=output.get_device()
-                    if output.get_device() is not None
-                    else device,  # type: ignore[arg-type]
+                    device=(
+                        output.get_device()
+                        if output.get_device() is not None
+                        else device
+                    ),  # type: ignore[arg-type]
                     dtype=output.get_dtype(),
                     size=[_maybe_expr(sz) for sz in merged_output.size()],
                     stride=[_maybe_expr(sz) for sz in merged_output.stride()],
