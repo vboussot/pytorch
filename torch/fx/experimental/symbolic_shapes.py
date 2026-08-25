@@ -73,7 +73,7 @@ from torch.fx.experimental.recording import (
     shape_env_check_state_equal,
     ShapeEnvEvent,
 )
-from torch.fx.experimental.sym_node import SymNode, SymTypes
+from torch.fx.experimental.sym_node import _NO_HINT, SymNode, SymTypes
 from torch.types import py_sym_types
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
@@ -2808,8 +2808,34 @@ class RuntimeAssert:
     stack: CapturedTraceback = field(repr=False)
 
 
+class _SymSafeMinMaxPrinter:
+    """Prints Max/Min as torch.sym_max/torch.sym_min.
+
+    Builtin max()/min() pick a branch by evaluating `a > b`, which guards on
+    backed symbols and raises a data-dependent error on unbacked ones. Any
+    printed expression that may be eval'd against SymInts has to avoid them.
+    """
+
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        if len(expr.args) < 2:
+            raise AssertionError("Max expects at least two arguments")
+        return self._fold_binary_call("torch.sym_max", expr.args)
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        if len(expr.args) < 2:
+            raise AssertionError("Min expects at least two arguments")
+        return self._fold_binary_call("torch.sym_min", expr.args)
+
+    def _fold_binary_call(self, fn: str, args: Sequence[sympy.Expr]) -> str:
+        printed = [self.doprint(a) for a in args]  # type: ignore[attr-defined]
+        result = printed[-1]
+        for arg in reversed(printed[:-1]):
+            result = f"{fn}({arg}, {result})"
+        return result
+
+
 # Used for printing SymExprs in compile_fx
-class SymExprPrinter(PythonPrinter):
+class SymExprPrinter(_SymSafeMinMaxPrinter, PythonPrinter):
     def _print_Float(self, expr: sympy.Float) -> str:
         return str(float(expr))
 
@@ -2912,7 +2938,7 @@ class _ShapeGuardPrinter(abc.ABC):
         ...
 
 
-class ShapeGuardPythonPrinter(_ShapeGuardPrinter, PythonPrinter):
+class ShapeGuardPythonPrinter(_SymSafeMinMaxPrinter, _ShapeGuardPrinter, PythonPrinter):
     """
     Python printer for shape guards that extends the base ShapeGuardPrinter.
 
@@ -2927,25 +2953,6 @@ class ShapeGuardPythonPrinter(_ShapeGuardPrinter, PythonPrinter):
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
         self._print_cache: dict[sympy.Expr, str] = {}
-
-    # Guards may be eval'd against unbacked SymInts; builtin max/min would
-    # trigger data-dependent errors, so emit torch.sym_max/sym_min instead.
-    def _print_Max(self, expr: sympy.Expr) -> str:
-        if len(expr.args) < 2:
-            raise AssertionError("Max expects at least two arguments")
-        return self._fold_binary_call("torch.sym_max", expr.args)
-
-    def _print_Min(self, expr: sympy.Expr) -> str:
-        if len(expr.args) < 2:
-            raise AssertionError("Min expects at least two arguments")
-        return self._fold_binary_call("torch.sym_min", expr.args)
-
-    def _fold_binary_call(self, fn: str, args: Sequence[sympy.Expr]) -> str:
-        printed = [self.doprint(a) for a in args]
-        result = printed[-1]
-        for arg in reversed(printed[:-1]):
-            result = f"{fn}({arg}, {result})"
-        return result
 
     def print_source(self, source: Source) -> str:
         """
@@ -3014,6 +3021,41 @@ class _ShapeGuardCppPrinter(_ShapeGuardPrinter, CppPrinter):
 
     def doprint(self, expr: sympy.Expr) -> str:
         return CppPrinter.doprint(self, expr)
+
+
+class _SymExprLocals(dict):  # type: ignore[type-arg]
+    """eval() locals for a printed sympy expression.
+
+    Builds a SymNode only for the symbols an expression actually names.
+    """
+
+    def __init__(self, shape_env: ShapeEnv) -> None:
+        super().__init__()
+        self._shape_env = shape_env
+
+    def __missing__(self, name: str) -> SymInt | SymFloat:
+        shape_env = self._shape_env
+        symbol = shape_env.name_to_symbol.get(name)
+        if symbol is None:
+            raise KeyError(name)
+        is_float = symbol_is_type(symbol, (SymT.FLOAT, SymT.UNBACKED_FLOAT))
+        pytype: type = float if is_float else int
+        val = shape_env.backed_var_to_val.get(symbol)
+        # _NO_HINT rather than None: None means "derive the hint for me", which for a
+        # nested-tensor symbol substitutes its SingletonInt and then fails to expand.
+        hint = (
+            pytype(val) if isinstance(val, (sympy.Integer, sympy.Float)) else _NO_HINT
+        )
+        node = SymNode(
+            symbol,
+            shape_env,
+            pytype,
+            hint,
+            fx_node=shape_env._create_fx_placeholder_and_z3var(symbol, pytype),
+        )
+        out = SymFloat(node) if is_float else SymInt(node)
+        self[name] = out
+        return out
 
 
 # A dataclass for storing shape guards
@@ -4018,6 +4060,8 @@ class ShapeEnv:
         # hints). The override is also recorded in var_to_hint_override
         # so it can be included in the FxGraphCache key.
         self.backed_var_to_val: dict[sympy.Symbol, sympy.Integer] = {}
+        # Every symbol this ShapeEnv minted, keyed by name.
+        self.name_to_symbol: dict[str, sympy.Symbol] = {}
         # Only set when propagate_real_tensors is on.
         # Used as last resort to avoid GuardOnDataDependent error in draft export.
         self.real_tensor_prop_unbacked_vals: dict[sympy.Symbol, sympy.Integer] = {}
@@ -4331,6 +4375,8 @@ class ShapeEnv:
             "counter",
             "log",
             "var_to_stack",
+            # a name lookup index, not part of the guard state
+            "name_to_symbol",
             "fx_node_cache",
             "graph",
             "validator",
@@ -5536,6 +5582,7 @@ class ShapeEnv:
             SymT.UNBACKED_FLOAT, self.unbacked_symfloat_counter
         )
         self.unbacked_symfloat_counter += 1
+        self.name_to_symbol[symbol.name] = symbol
         self.counter["create_unbacked_symbol"] += 1
         if not self._ignore_fresh_unbacked_symbols_tls():
             self.pending_fresh_unbacked_symbols.append(symbol)
@@ -5563,6 +5610,7 @@ class ShapeEnv:
             SymT.UNBACKED_INT, self.unbacked_symint_counter, integer=True
         )
         self.unbacked_symint_counter += 1
+        self.name_to_symbol[symbol.name] = symbol
         if not self._ignore_fresh_unbacked_symbols_tls():
             self.pending_fresh_unbacked_symbols.append(symbol)
         self.counter["create_unbacked_symbol"] += 1
@@ -5594,6 +5642,8 @@ class ShapeEnv:
         and seed its metadata.  Used when lifting a symbol minted from a
         foreign ShapeEnv expression into this env."""
         self.unbacked_inputs.add(expr)
+        # Minted by a foreign ShapeEnv, so none of this env's symbol creators ran.
+        self.name_to_symbol[expr.name] = expr
         if value_range is not None:
             self.var_to_range[expr] = value_range
         if optimization_hint is not None:
@@ -5645,6 +5695,7 @@ class ShapeEnv:
             SymT.UNBACKED_INT, self.unbacked_symint_counter, integer=True
         )
         self.unbacked_symint_counter += 1
+        self.name_to_symbol[symbol.name] = symbol
         if not self._ignore_fresh_unbacked_symbols_tls():
             self.pending_fresh_unbacked_symbols.append(symbol)
         self.counter["create_unbacked_symbol"] += 1
@@ -5859,6 +5910,7 @@ class ShapeEnv:
                 sympy_expr = make_symbol(
                     SymT.FLOAT, symbol_id, positive=positive, real=True
                 )
+            self.name_to_symbol[sympy_expr.name] = sympy_expr
             self.source_to_var[source_name] = sympy_expr
             # We always associate vars to vals
             if isinstance(val, int):
@@ -6016,6 +6068,7 @@ class ShapeEnv:
         if expr in self.backed_var_to_val:
             raise AssertionError(f"{expr} already exists")
         self.backed_var_to_val[expr] = sympy.Integer(val)
+        self.name_to_symbol[expr.name] = expr
 
     @property
     @deprecated(
@@ -7037,22 +7090,16 @@ class ShapeEnv:
             return " and ".join(produced_guards)
         return None
 
-    def evaluate_symexpr(self, code: str) -> int | float | bool:
-        """
-        To be used by compile_fx to evaluate symexprs
-        """
-        args = {str(e): val for e, val in self.backed_var_to_val.items()}
-        return eval(code, SYMPY_INTERP, args)
-
+    # Creates FX placeholders in the ShapeEnv, so it must be replayable like any
+    # other ShapeEnv mutation: translation validation replays self.events onto a
+    # fresh ShapeEnv, and an unrecorded placeholder makes that replay fail with
+    # "Node sN not found in name_to_node".
+    @record_shapeenv_event()
     def deserialize_symexpr(self, code: str) -> SymInt | SymFloat | SymBool:
         """
         To be used by compile_fx to deserialize symexprs
         """
-        args = {
-            str(e): SymInt(SymNode(e, self, int, int(val), fx_node=None))
-            for e, val in self.backed_var_to_val.items()
-        }
-        return eval(code, SYMPY_INTERP, args)
+        return eval(code, SYMPY_INTERP, _SymExprLocals(self))
 
     def evaluate_guards_expression(self, code: str, args: Sequence[object]) -> bool:
         """
