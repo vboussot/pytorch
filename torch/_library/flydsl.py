@@ -116,6 +116,9 @@ def wrap_flydsl(
     it is omitted, every tensor argument is conservatively treated as mutated.
     Runtime arguments must be graphable PyTorch values rather than
     preconstructed FlyDSL ``JitArgument`` objects.
+    AOT compilation supports tensor, pointer, numeric scalar, and implicit
+    current-stream arguments. Custom or composite FlyDSL JIT arguments require
+    a declarative AOT ABI and are not supported yet.
 
     Variadic launcher parameters are not supported.
     """
