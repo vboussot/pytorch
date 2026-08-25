@@ -59,6 +59,26 @@ class TestFlyDSLTemplate(TestCase):
             reason = flydsl_utils._flydsl_runtime_unavailable_reason()
         self.assertIsNone(reason)
 
+    def test_runtime_available_for_requested_minimum_version(self):
+        package_spec = SimpleNamespace(submodule_search_locations=["package"])
+        with (
+            mock.patch.object(flydsl_utils._cuda, "is_built", return_value=True),
+            mock.patch.object(torch.version, "hip", "7.0"),
+            mock.patch.object(flydsl_utils, "find_spec", return_value=package_spec),
+            mock.patch.object(
+                flydsl_utils, "_pathfinder_find_spec", return_value=SimpleNamespace()
+            ),
+            mock.patch.object(
+                flydsl_utils,
+                "_available_version",
+                return_value=SimpleNamespace(release=(0, 2, 3)),
+            ),
+        ):
+            self.assertTrue(flydsl_utils.runtime_available(minimum_version=(0, 2, 3)))
+            self.assertTrue(flydsl_utils.runtime_available(minimum_version=(0, 2, 2)))
+            self.assertFalse(flydsl_utils.runtime_available(minimum_version=(0, 2, 4)))
+            self.assertFalse(flydsl_utils.runtime_available())
+
     def test_unavailable_runtime_declines_choice(self):
         template_name = f"flydsl_unavailable_test_{id(self)}"
         self.addCleanup(FlyDSLTemplate.all_templates.pop, template_name, None)
