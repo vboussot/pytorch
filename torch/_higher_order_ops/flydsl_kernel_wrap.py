@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import contextlib
 import inspect
 import threading
 from dataclasses import dataclass
@@ -74,9 +75,15 @@ class TraceableFlyDSLLauncher:
         registration = flydsl_launcher_side_table.get_registration(self.launcher_idx)
         bound = registration.signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        bound_args = tuple(bound.arguments.values())
+        if not is_wrap_flydsl_enabled():
+            _validate_runtime_arguments(registration, bound_args)
+            _validate_eager_stream(bound_args)
+            invoke_flydsl_launcher(registration, bound_args)
+            return
         runtime_args, call_spec_idx = partition_flydsl_launcher_arguments(
             registration,
-            tuple(bound.arguments.values()),
+            bound_args,
         )
         flydsl_kernel_wrapper_mutation(
             self.launcher_idx,
@@ -152,6 +159,22 @@ class FlyDSLLauncherSideTable:
 
 
 flydsl_launcher_side_table = FlyDSLLauncherSideTable()
+
+_wrap_flydsl_state = threading.local()
+
+
+def is_wrap_flydsl_enabled() -> bool:
+    return getattr(_wrap_flydsl_state, "enabled", True)
+
+
+@contextlib.contextmanager
+def set_wrap_flydsl_enabled(enabled: bool):
+    previous = is_wrap_flydsl_enabled()
+    _wrap_flydsl_state.enabled = enabled
+    try:
+        yield
+    finally:
+        _wrap_flydsl_state.enabled = previous
 
 
 def _constant_key(value: Any) -> tuple[Any, ...]:
@@ -320,6 +343,20 @@ def invoke_flydsl_launcher(
     registration.launcher(*positional_args, **keyword_args)
 
 
+def _validate_eager_stream(args: tuple[Any, ...]) -> None:
+    cuda_devices = {
+        arg.device
+        for arg in args
+        if isinstance(arg, Tensor) and arg.device.type == "cuda"
+    }
+    for device in cuda_devices:
+        if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
+            raise RuntimeError(
+                "eager wrap_flydsl launches require the default device stream; "
+                "AOTInductor launchers use PyTorch's current device stream"
+            )
+
+
 class FlyDSLKernelWrapperMutation(HigherOrderOperator):
     def __init__(self) -> None:
         super().__init__("flydsl_kernel_wrapper_mutation", cacheable=True)
@@ -372,17 +409,7 @@ def flydsl_kernel_wrapper_mutation_dense(
     registration = flydsl_launcher_side_table.get_registration(launcher_idx)
     full_args = restore_flydsl_launcher_arguments(args, call_spec_idx)
     _validate_runtime_arguments(registration, full_args)
-    cuda_devices = {
-        arg.device
-        for arg in full_args
-        if isinstance(arg, Tensor) and arg.device.type == "cuda"
-    }
-    for device in cuda_devices:
-        if torch.cuda.current_stream(device) != torch.cuda.default_stream(device):
-            raise RuntimeError(
-                "eager wrap_flydsl launches require the default device stream; "
-                "AOTInductor launchers use PyTorch's current device stream"
-            )
+    _validate_eager_stream(full_args)
     invoke_flydsl_launcher(
         registration,
         full_args,
